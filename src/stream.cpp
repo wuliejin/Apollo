@@ -6,7 +6,9 @@
 // standard includes
 #include <fstream>
 #include <future>
+#include <iomanip>
 #include <queue>
+#include <sstream>
 
 // lib includes
 #include <boost/endian/arithmetic.hpp>
@@ -85,6 +87,15 @@ using asio::ip::udp;
 using namespace std::literals;
 
 namespace stream {
+
+  // Client recovery requests, reported and reset by the periodic network stats log
+  static std::atomic<uint32_t> net_stats_rfi_requests {0};
+  static std::atomic<uint32_t> net_stats_idr_requests {0};
+  // Per-frame FEC reports, which the client only sends for frames that lost packets
+  static std::atomic<uint32_t> net_stats_fec_recovered_frames {0};
+  static std::atomic<uint32_t> net_stats_fec_lost_frames {0};
+  static std::atomic<uint32_t> net_stats_fec_lost_packets {0};
+  static std::atomic<uint32_t> net_stats_fec_max_loss_pct {0};
 
   enum class socket_e : int {
     video,  ///< Video
@@ -331,6 +342,284 @@ namespace stream {
     net::host_t _host;
   };
 
+  /**
+   * @brief Video packets carried over several TCP connections instead of UDP.
+   *
+   * Each packet is framed with a 16-bit big-endian length and a sequence number and handed to the connection with the
+   * fewest queued bytes; one thread per connection drains its queue with blocking writes. When
+   * every connection already holds more than video_tcp_queue_kb, the packet is dropped rather
+   * than queued, so a stalled path shows up as packet loss (handled by FEC and RFI) instead of
+   * a growing delay.
+   */
+  class video_tcp_t {
+  public:
+    explicit video_tcp_t(std::string ping_payload):
+        ping_payload {std::move(ping_payload)},
+        max_queue {(size_t) config::stream.video_tcp_queue_kb * 1024} {
+    }
+
+    ~video_tcp_t() {
+      std::vector<std::unique_ptr<conn_t>> to_join;
+      {
+        std::lock_guard lg {mutex};
+        closed = true;
+        for (auto &c : conns) {
+          boost::system::error_code ec;
+          c->sock.close(ec);
+        }
+        to_join.swap(conns);
+      }
+      cv.notify_all();
+      stats_cv.notify_all();
+      if (stats_thread.joinable()) {
+        stats_thread.join();
+      }
+      for (auto &c : to_join) {
+        if (c->thread.joinable()) {
+          c->thread.join();
+        }
+      }
+    }
+
+    const std::string ping_payload;
+
+    void add(tcp::socket &&sock) {
+      std::lock_guard lg {mutex};
+      if (closed || conns.size() >= 16) {
+        return;
+      }
+      if (!platf::enable_tcp_stats(sock.native_handle())) {
+        BOOST_LOG(warning) << "Video TCP: kernel statistics unavailable for this connection"sv;
+      }
+      conns.emplace_back(std::make_unique<conn_t>(std::move(sock)));
+      auto *c = conns.back().get();
+      c->index = (int) conns.size();
+      c->thread = std::thread {&video_tcp_t::send_loop, this, c};
+      // New connections start in slow start; let them queue more until their windows have grown
+      auto now = std::chrono::steady_clock::now();
+      warmup_until = now + 3s;
+      stats_fast_until = now + 5s;
+      if (!stats_thread.joinable()) {
+        stats_start = now;
+        stats_thread = std::thread {&video_tcp_t::stats_loop, this};
+      }
+      BOOST_LOG(info) << "Video TCP connection "sv << conns.size() << " attached"sv;
+    }
+
+    /**
+     * @brief Number of connections still alive. Video falls back to UDP when this is 0.
+     */
+    int alive() {
+      std::lock_guard lg {mutex};
+      return (int) std::count_if(std::begin(conns), std::end(conns), [](auto &c) {
+        return !c->dead;
+      });
+    }
+
+    /**
+     * @brief Queue one packet. Returns false if it was dropped.
+     */
+    bool send(const char *prefix, size_t prefix_size, const char *data, size_t size) {
+      std::lock_guard lg {mutex};
+      conn_t *best = nullptr;
+      for (auto &c : conns) {
+        if (!c->dead && (!best || c->backlog() < best->backlog())) {
+          best = c.get();
+        }
+      }
+      auto limit = std::chrono::steady_clock::now() < warmup_until ? std::max<size_t>(max_queue, 1024 * 1024) : max_queue;
+      if (!best || best->backlog() > limit) {
+        ++dropped;
+        return false;
+      }
+      // Header: 16-bit payload length, then a 32-bit sequence number the client uses to put
+      // packets from different connections back in order
+      auto len = util::endian::big<uint16_t>((uint16_t) (prefix_size + size));
+      auto seq = util::endian::big<uint32_t>(next_seq++);
+      best->pending.append((const char *) &len, sizeof(len));
+      best->pending.append((const char *) &seq, sizeof(seq));
+      best->pending.append(prefix, prefix_size);
+      best->pending.append(data, size);
+      cv.notify_all();
+      return true;
+    }
+
+  private:
+    struct conn_t {
+      explicit conn_t(tcp::socket &&sock):
+          sock {std::move(sock)} {
+      }
+
+      size_t backlog() const {
+        return pending.size() + inflight;
+      }
+
+      tcp::socket sock;
+      std::string pending;
+      size_t inflight = 0;
+      bool dead = false;
+      int index = 0;
+      std::thread thread;
+    };
+
+    // Logs each connection's queue and kernel TCP counters: every 100 ms for 5 s after a connection
+    // attaches and while packets are dropped or queued up, otherwise once a second
+    void stats_loop() {
+      std::unique_lock ul {mutex};
+      auto next = std::chrono::steady_clock::now();
+      uint64_t last_dropped = 0;
+      while (!stats_cv.wait_until(ul, next, [&]() {
+        return closed;
+      })) {
+        auto now = std::chrono::steady_clock::now();
+        bool busy = now < stats_fast_until || dropped != last_dropped;
+        std::vector<std::tuple<int, size_t, std::uintptr_t, bool>> snapshot;
+        for (auto &c : conns) {
+          snapshot.emplace_back(c->index, c->backlog(), (std::uintptr_t) c->sock.native_handle(), c->dead);
+          busy = busy || c->backlog() > 64 * 1024;
+        }
+        auto drops = dropped - last_dropped;
+        last_dropped = dropped;
+        ul.unlock();
+
+        std::ostringstream ss;
+        ss << "Video TCP stats +" << std::chrono::duration_cast<std::chrono::milliseconds>(now - stats_start).count()
+           << "ms drop " << drops;
+        for (auto &[index, backlog, native, dead] : snapshot) {
+          ss << " | c" << index << " q" << backlog / 1024 << "k " << (dead ? "dead"s : platf::tcp_stats(native));
+        }
+        BOOST_LOG(info) << ss.str();
+
+        ul.lock();
+        next = now + (busy ? 100ms : 1000ms);
+      }
+    }
+
+    void send_loop(conn_t *c) {
+      std::string out;
+      std::unique_lock ul {mutex};
+      while (true) {
+        cv.wait(ul, [&]() {
+          return closed || !c->pending.empty();
+        });
+        if (closed) {
+          return;
+        }
+        out.swap(c->pending);
+        c->inflight = out.size();
+        ul.unlock();
+
+        boost::system::error_code ec;
+        asio::write(c->sock, asio::buffer(out), ec);
+        out.clear();
+
+        ul.lock();
+        c->inflight = 0;
+        if (ec) {
+          if (!closed) {
+            BOOST_LOG(warning) << "Video TCP connection lost: "sv << ec.message();
+          }
+          c->dead = true;
+          c->pending.clear();
+          return;
+        }
+      }
+    }
+
+    const size_t max_queue;
+    std::chrono::steady_clock::time_point warmup_until;
+    uint32_t next_seq = 0;
+    uint64_t dropped = 0;
+    std::chrono::steady_clock::time_point stats_start;
+    std::chrono::steady_clock::time_point stats_fast_until;
+    std::thread stats_thread;
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::condition_variable stats_cv;
+    bool closed = false;
+    std::vector<std::unique_ptr<conn_t>> conns;
+  };
+
+  // Sessions that asked for TCP video, looked up by their A/V ping payload when a connection arrives
+  static std::mutex video_tcp_registry_mutex;
+  static std::vector<std::weak_ptr<video_tcp_t>> video_tcp_registry;
+
+  /**
+   * @brief Read the client hello and attach the connection to its session.
+   *
+   * Hello: "SSVT", version 2, connection index, 2 reserved bytes, then the 16-byte ping payload
+   * the client got from RTSP SETUP. The server answers "SSVK" once the connection is attached.
+   */
+  static void video_tcp_handshake(tcp::socket sock) {
+    boost::system::error_code ec;
+    auto native = sock.native_handle();
+#ifdef _WIN32
+    DWORD timeout_ms = 3000;
+    setsockopt(native, SOL_SOCKET, SO_RCVTIMEO, (const char *) &timeout_ms, sizeof(timeout_ms));
+    // Bounds how long a send thread can block on a dead path; the connection is dropped after it
+    setsockopt(native, SOL_SOCKET, SO_SNDTIMEO, (const char *) &timeout_ms, sizeof(timeout_ms));
+#else
+    timeval tv {3, 0};
+    setsockopt(native, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(native, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
+
+    std::array<char, 24> hello;
+    asio::read(sock, asio::buffer(hello), ec);
+    if (ec || std::string_view {hello.data(), 4} != "SSVT"sv || hello[4] != 2) {
+      BOOST_LOG(warning) << "Rejected video TCP connection: bad hello"sv;
+      return;
+    }
+    std::string payload {hello.data() + 8, 16};
+
+    std::shared_ptr<video_tcp_t> target;
+    {
+      std::lock_guard lg {video_tcp_registry_mutex};
+      for (auto it = std::begin(video_tcp_registry); it != std::end(video_tcp_registry);) {
+        auto t = it->lock();
+        if (!t) {
+          it = video_tcp_registry.erase(it);
+          continue;
+        }
+        if (t->ping_payload == payload) {
+          target = t;
+        }
+        ++it;
+      }
+    }
+    if (!target) {
+      BOOST_LOG(warning) << "Rejected video TCP connection: no matching session"sv;
+      return;
+    }
+
+    sock.set_option(tcp::no_delay(true), ec);
+    if (config::stream.video_tcp_sndbuf_kb > 0) {
+      sock.set_option(asio::socket_base::send_buffer_size(config::stream.video_tcp_sndbuf_kb * 1024), ec);
+    }
+    asio::write(sock, asio::buffer("SSVK", 4), ec);
+    if (ec) {
+      return;
+    }
+    target->add(std::move(sock));
+  }
+
+  static void videoTcpAcceptThread(tcp::acceptor &acceptor) {
+    while (acceptor.is_open()) {
+      boost::system::error_code ec;
+      tcp::socket sock {acceptor.get_executor()};
+      acceptor.accept(sock, ec);
+      if (ec) {
+        if (!acceptor.is_open() || ec == asio::error::operation_aborted) {
+          break;
+        }
+        std::this_thread::sleep_for(100ms);
+        continue;
+      }
+      // Handshake off this thread so a silent client can't hold up the others
+      std::thread {video_tcp_handshake, std::move(sock)}.detach();
+    }
+  }
+
   struct broadcast_ctx_t {
     message_queue_queue_t message_queue_queue;
 
@@ -343,6 +632,9 @@ namespace stream {
 
     udp::socket video_sock {io_context};
     udp::socket audio_sock {io_context};
+
+    tcp::acceptor video_tcp_acceptor {io_context};
+    std::thread video_tcp_thread;
 
     control_server_t control_server;
   };
@@ -376,6 +668,9 @@ namespace stream {
       safe::mail_raw_t::event_t<std::pair<int64_t, int64_t>> invalidate_ref_frames_events;
 
       std::unique_ptr<platf::deinit_t> qos;
+
+      // Set when the client asked for TCP video
+      std::shared_ptr<video_tcp_t> tcp;
     } video;
 
     struct {
@@ -958,8 +1253,37 @@ namespace stream {
 
     server->map(packetTypes[IDX_REQUEST_IDR_FRAME], [&](session_t *session, const std::string_view &payload) {
       BOOST_LOG(debug) << "type [IDX_REQUEST_IDR_FRAME]"sv;
+      ++net_stats_idr_requests;
 
       session->video.idr_events->raise(true);
+    });
+
+    server->map(SS_FRAME_FEC_PTYPE, [&](session_t *session, const std::string_view &payload) {
+      if (payload.size() < sizeof(SS_FRAME_FEC_STATUS)) {
+        return;
+      }
+
+      auto *status = (const SS_FRAME_FEC_STATUS *) payload.data();
+      uint32_t total_data = util::endian::big(status->totalDataPackets);
+      uint32_t total = total_data + util::endian::big(status->totalParityPackets);
+      uint32_t received = util::endian::big(status->receivedDataPackets) + util::endian::big(status->receivedParityPackets);
+      if (total == 0 || received > total) {
+        return;
+      }
+
+      BOOST_LOG(verbose) << "Frame "sv << util::endian::big(status->frameIndex) << " FEC status: "sv << received << '/' << total
+                         << " received, "sv << total_data << " needed"sv;
+
+      if (received >= total_data) {
+        ++net_stats_fec_recovered_frames;
+      } else {
+        ++net_stats_fec_lost_frames;
+      }
+      net_stats_fec_lost_packets += total - received;
+
+      uint32_t loss_pct = 100 * (total - received) / total;
+      uint32_t prev = net_stats_fec_max_loss_pct;
+      while (loss_pct > prev && !net_stats_fec_max_loss_pct.compare_exchange_weak(prev, loss_pct)) {}
     });
 
     server->map(packetTypes[IDX_INVALIDATE_REF_FRAMES], [&](session_t *session, const std::string_view &payload) {
@@ -971,6 +1295,7 @@ namespace stream {
         << "type [IDX_INVALIDATE_REF_FRAMES]"sv << std::endl
         << "firstFrame [" << firstFrame << ']' << std::endl
         << "lastFrame [" << lastFrame << ']';
+      ++net_stats_rfi_requests;
 
       session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
     });
@@ -1348,12 +1673,53 @@ namespace stream {
 
     auto ratecontrol_next_frame_start = std::chrono::steady_clock::now();
 
+    // Token bucket pacing. All sessions share this thread and the host uplink, so one bucket covers them all.
+    const bool paced = config::stream.video_pacing_mbps > 0;
+    const double pacing_bytes_per_ns = config::stream.video_pacing_mbps * 1e6 / 8 / 1e9;
+    const size_t pacing_burst_bytes = config::stream.video_pacing_burst_kb * 1024;
+    // Allow one extra burst of credit to absorb timer oversleep without dropping below the target rate
+    const double pacing_bucket_cap = 2.0 * pacing_burst_bytes;
+    double pacing_tokens = pacing_bucket_cap;
+    auto pacing_last_refill = std::chrono::steady_clock::now();
+    auto pacing_refill = [&]() {
+      auto now = std::chrono::steady_clock::now();
+      pacing_tokens = std::min(pacing_bucket_cap, pacing_tokens + std::chrono::duration<double, std::nano>(now - pacing_last_refill).count() * pacing_bytes_per_ns);
+      pacing_last_refill = now;
+    };
+
+    if (paced) {
+      BOOST_LOG(info) << "Video pacing enabled: "sv << config::stream.video_pacing_mbps << " Mbps, "sv << config::stream.video_pacing_burst_kb << " KB bursts"sv;
+    }
+
+    // Periodic network stats
+    struct {
+      std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+      uint64_t frames = 0;
+      uint64_t wire_bytes = 0;
+      uint64_t data_shards = 0;
+      uint64_t parity_shards = 0;
+      uint64_t fec_skipped = 0;
+      size_t max_frame_packets = 0;
+      double pace_wait_ms = 0;
+      double max_send_ms = 0;
+      double sum_e2e_ms = 0;
+      double max_e2e_ms = 0;
+      uint64_t e2e_frames = 0;
+      uint64_t tcp_packets = 0;
+      uint64_t tcp_dropped = 0;
+      int tcp_conns = -1;
+    } ns;
+    const auto stats_interval = std::chrono::seconds(config::stream.network_stats_interval);
+
     while (auto packet = packets->pop()) {
       if (shutdown_event->peek()) {
         break;
       }
 
       frame_network_latency_logger.first_point_now();
+      const auto frame_send_start = std::chrono::steady_clock::now();
+      const auto frame_capture_time = packet->frame_timestamp;
+      size_t frame_packets = 0;
 
       auto session = (session_t *) packet->channel_data;
       auto lowseq = session->video.lowseq;
@@ -1399,6 +1765,9 @@ namespace stream {
       }
 
       auto fecPercentage = config::stream.fec_percentage;
+      if (config::stream.video_tcp_fec_percentage >= 0 && session->video.tcp && session->video.tcp->alive() > 0) {
+        fecPercentage = config::stream.video_tcp_fec_percentage;
+      }
 
       // Insert space for packet headers
       auto blocksize = session->config.packetsize + MAX_RTP_HEADER_SIZE;
@@ -1428,6 +1797,7 @@ namespace stream {
       if (fec_blocks_needed > MAX_FEC_BLOCKS) {
         BOOST_LOG(warning) << "Skipping FEC for abnormally large encoded frame (needed "sv << fec_blocks_needed << " FEC blocks)"sv;
         fecPercentage = 0;
+        ++ns.fec_skipped;
         fec_blocks_needed = MAX_FEC_BLOCKS;
       }
 
@@ -1472,6 +1842,13 @@ namespace stream {
         // unusually small packet size.
         // Generic Segmentation Offload on Linux can't do more than 64.
         send_batch_size = std::min<size_t>(64, send_batch_size);
+
+        // Bytes each video packet occupies on the wire after the IP/UDP headers are added
+        const size_t wire_packet_bytes = blocksize + (session->video.cipher ? sizeof(video_packet_enc_prefix_t) : 0) +
+                                         (session->video.peer.address().is_v6() ? 48 : 28);
+        if (paced) {
+          send_batch_size = std::clamp<size_t>(pacing_burst_bytes / wire_packet_bytes, 1, send_batch_size);
+        }
 
         // Don't ignore the last ratecontrol group of the previous frame
         auto ratecontrol_frame_start = std::max(ratecontrol_next_frame_start, std::chrono::steady_clock::now());
@@ -1572,11 +1949,27 @@ namespace stream {
 
             if (x - next_shard_to_send + 1 >= send_batch_size ||
                 x + 1 == shards.size()) {
+              size_t current_batch_size = x - next_shard_to_send + 1;
+
+              if (paced) {
+                // Wait until the bucket holds enough credit for this batch. Credit is capped,
+                // so oversleeping or idle time never turns into a large catch-up burst.
+                const double batch_bytes = (double) current_batch_size * wire_packet_bytes;
+                pacing_refill();
+                if (pacing_tokens < batch_bytes) {
+                  auto wait_start = pacing_last_refill;
+                  timer->sleep_for(std::chrono::nanoseconds((int64_t) ((batch_bytes - pacing_tokens) / pacing_bytes_per_ns)));
+                  pacing_refill();
+                  ns.pace_wait_ms += std::chrono::duration<double, std::milli>(pacing_last_refill - wait_start).count();
+                }
+                // Undersleeping leaves a small debt that the next batch repays
+                pacing_tokens -= batch_bytes;
+              }
               // Do pacing within the frame.
               // Also trigger pacing before the first send_batch() of the frame
               // to account for the last send_batch() of the previous frame.
-              if (ratecontrol_group_packets_sent >= ratecontrol_packets_in_1ms ||
-                  ratecontrol_frame_packets_sent == 0) {
+              else if (ratecontrol_group_packets_sent >= ratecontrol_packets_in_1ms ||
+                       ratecontrol_frame_packets_sent == 0) {
                 auto due = ratecontrol_frame_start +
                            std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
                              ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
@@ -1588,14 +1981,26 @@ namespace stream {
 
                 ratecontrol_group_packets_sent = 0;
               }
-
-              size_t current_batch_size = x - next_shard_to_send + 1;
               batch_info.block_offset = next_shard_to_send;
               batch_info.block_count = current_batch_size;
 
               frame_send_batch_latency_logger.first_point_now();
+              int tcp_alive = session->video.tcp ? session->video.tcp->alive() : 0;
+              if (session->video.tcp) {
+                ns.tcp_conns = tcp_alive;
+              }
+              if (tcp_alive > 0) {
+                for (size_t y = 0; y < current_batch_size; y++) {
+                  auto i = next_shard_to_send + y;
+                  if (session->video.tcp->send(shards.prefix(i), shards.prefixsize, shards.data(i), shards.blocksize)) {
+                    ++ns.tcp_packets;
+                  } else {
+                    ++ns.tcp_dropped;
+                  }
+                }
+              }
               // Use a batched send if it's supported on this platform
-              if (!platf::send_batch(batch_info)) {
+              else if (!platf::send_batch(batch_info)) {
                 // Batched send is not available, so send each packet individually
                 BOOST_LOG(verbose) << "Falling back to unbatched send"sv;
                 for (auto y = 0; y < current_batch_size; y++) {
@@ -1622,9 +2027,19 @@ namespace stream {
           }
 
           // remember this in case the next frame comes immediately
-          ratecontrol_next_frame_start = ratecontrol_frame_start +
-                                         std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
-                                           ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
+          if (paced) {
+            // The token bucket carries pacing across frames; this only feeds dupe frame timestamps
+            ratecontrol_next_frame_start = std::chrono::steady_clock::now();
+          } else {
+            ratecontrol_next_frame_start = ratecontrol_frame_start +
+                                           std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
+                                             ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
+          }
+
+          frame_packets += shards.size();
+          ns.data_shards += shards.data_shards;
+          ns.parity_shards += shards.size() - shards.data_shards;
+          ns.wire_bytes += shards.size() * wire_packet_bytes;
 
           frame_network_latency_logger.second_point_now_and_log();
 
@@ -1639,6 +2054,42 @@ namespace stream {
         });
 
         session->video.lowseq = lowseq;
+
+        auto frame_done = std::chrono::steady_clock::now();
+        ++ns.frames;
+        ns.max_frame_packets = std::max(ns.max_frame_packets, frame_packets);
+        ns.max_send_ms = std::max(ns.max_send_ms, std::chrono::duration<double, std::milli>(frame_done - frame_send_start).count());
+        if (frame_capture_time) {
+          // Capture to last packet handed to the NIC: encode, queueing and pacing delay combined
+          auto e2e_ms = std::chrono::duration<double, std::milli>(frame_done - *frame_capture_time).count();
+          ns.sum_e2e_ms += e2e_ms;
+          ns.max_e2e_ms = std::max(ns.max_e2e_ms, e2e_ms);
+          ++ns.e2e_frames;
+        }
+
+        if (stats_interval.count() > 0 && frame_done - ns.start >= stats_interval) {
+          auto secs = std::chrono::duration<double>(frame_done - ns.start).count();
+          auto total_shards = std::max<uint64_t>(1, ns.data_shards + ns.parity_shards);
+          BOOST_LOG(info) << std::fixed << std::setprecision(1)
+                          << "Network stats: "sv << ns.frames / secs << " fps, "sv
+                          << ns.wire_bytes * 8 / secs / 1e6 << " Mbps on wire, "sv
+                          << "parity "sv << 100.0 * ns.parity_shards / total_shards << "%, "sv
+                          << "avg frame "sv << (double) total_shards / std::max<uint64_t>(1, ns.frames) << " pkts, "sv
+                          << "max frame "sv << ns.max_frame_packets << " pkts, "sv
+                          << "max send "sv << ns.max_send_ms << " ms, "sv
+                          << "capture->sent avg "sv << ns.sum_e2e_ms / std::max<uint64_t>(1, ns.e2e_frames)
+                          << " max "sv << ns.max_e2e_ms << " ms, "sv
+                          << "pacing wait "sv << ns.pace_wait_ms << " ms, "sv
+                          << "fec skipped "sv << ns.fec_skipped << ", "sv
+                          << "client RFI "sv << net_stats_rfi_requests.exchange(0) << ", IDR "sv << net_stats_idr_requests.exchange(0) << ", "sv
+                          << "client FEC: recovered "sv << net_stats_fec_recovered_frames.exchange(0)
+                          << " lost "sv << net_stats_fec_lost_frames.exchange(0) << " frames, "sv
+                          << net_stats_fec_lost_packets.exchange(0) << " pkts lost, "sv
+                          << "worst frame loss "sv << net_stats_fec_max_loss_pct.exchange(0) << "%"sv
+                          << (ns.tcp_conns >= 0 ? ", tcp conns "s + std::to_string(ns.tcp_conns) + ", tcp pkts " + std::to_string(ns.tcp_packets) + ", tcp dropped " + std::to_string(ns.tcp_dropped) : ""s);
+          ns = {};
+          ns.start = frame_done;
+        }
       } catch (const std::exception &e) {
         BOOST_LOG(error) << "Broadcast video failed "sv << e.what();
         std::this_thread::sleep_for(100ms);
@@ -1801,6 +2252,26 @@ namespace stream {
       return -1;
     }
 
+    if (config::stream.video_tcp_port > 0) {
+      auto tcp_protocol = address_family == net::IPV4 ? tcp::v4() : tcp::v6();
+      ctx.video_tcp_acceptor.open(tcp_protocol, ec);
+      if (!ec) {
+        ctx.video_tcp_acceptor.set_option(tcp::acceptor::reuse_address(true), ec);
+        ctx.video_tcp_acceptor.bind(tcp::endpoint(tcp_protocol, (std::uint16_t) config::stream.video_tcp_port), ec);
+      }
+      if (!ec) {
+        ctx.video_tcp_acceptor.listen(asio::socket_base::max_listen_connections, ec);
+      }
+      if (ec) {
+        BOOST_LOG(error) << "Couldn't listen for video TCP on port ["sv << config::stream.video_tcp_port << "]: "sv << ec.message();
+        boost::system::error_code ignored;
+        ctx.video_tcp_acceptor.close(ignored);
+      } else {
+        BOOST_LOG(info) << "Video TCP transport listening on port "sv << config::stream.video_tcp_port;
+        ctx.video_tcp_thread = std::thread {videoTcpAcceptThread, std::ref(ctx.video_tcp_acceptor)};
+      }
+    }
+
     ctx.message_queue_queue = std::make_shared<message_queue_queue_t::element_type>(30);
 
     ctx.video_thread = std::thread {videoBroadcastThread, std::ref(ctx.video_sock)};
@@ -1829,6 +2300,10 @@ namespace stream {
 
     ctx.video_sock.close();
     ctx.audio_sock.close();
+    {
+      boost::system::error_code ec;
+      ctx.video_tcp_acceptor.close(ec);
+    }
 
     video_packets.reset();
     audio_packets.reset();
@@ -1841,6 +2316,9 @@ namespace stream {
     ctx.audio_thread.join();
     BOOST_LOG(debug) << "Waiting for main control thread to end..."sv;
     ctx.control_thread.join();
+    if (ctx.video_tcp_thread.joinable()) {
+      ctx.video_tcp_thread.join();
+    }
     BOOST_LOG(debug) << "All broadcasting threads ended"sv;
 
     broadcast_shutdown_event->reset();
@@ -2174,6 +2652,12 @@ namespace stream {
       session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);
       session->video.lowseq = 0;
       session->video.ping_payload = launch_session.av_ping_payload;
+      if (config.videoTcpConnections > 0) {
+        BOOST_LOG(info) << "Client requested video over "sv << config.videoTcpConnections << " TCP connections"sv;
+        session->video.tcp = std::make_shared<video_tcp_t>(launch_session.av_ping_payload);
+        std::lock_guard lg {video_tcp_registry_mutex};
+        video_tcp_registry.emplace_back(session->video.tcp);
+      }
       if (config.encryptionFlagsEnabled & SS_ENC_VIDEO) {
         BOOST_LOG(info) << "Video encryption enabled"sv;
         session->video.cipher = crypto::cipher::gcm_t {

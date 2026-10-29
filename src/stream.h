@@ -35,6 +35,9 @@ namespace stream {
 
     uint32_t encryptionFlagsEnabled;
 
+    // Number of TCP connections the client will open for video (0 = UDP only)
+    int videoTcpConnections;
+
     std::optional<int> gcmap;
   };
 

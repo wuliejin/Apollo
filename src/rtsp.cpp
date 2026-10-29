@@ -810,6 +810,10 @@ namespace rtsp_stream {
     ss << "a=x-ss-general.encryptionSupported:" << encryption_flags_supported << std::endl;
     ss << "a=x-ss-general.encryptionRequested:" << encryption_flags_requested << std::endl;
 
+    if (config::stream.video_tcp_port > 0) {
+      ss << "a=x-ss-video.tcpPort:"sv << config::stream.video_tcp_port << std::endl;
+    }
+
     if (video::last_encoder_probe_supported_ref_frames_invalidation) {
       ss << "a=x-nv-video[0].refPicInvalidation:1"sv << std::endl;
     }
@@ -984,6 +988,7 @@ namespace rtsp_stream {
     args.try_emplace("x-ss-general.encryptionEnabled"sv, "0"sv);
     args.try_emplace("x-ss-video[0].chromaSamplingType"sv, "0"sv);
     args.try_emplace("x-ss-video[0].intraRefresh"sv, "0"sv);
+    args.try_emplace("x-ss-video.tcpConnections"sv, "0"sv);
 
     stream::config_t config;
 
@@ -1004,6 +1009,7 @@ namespace rtsp_stream {
       config.audioQosType = util::from_view(args.at("x-nv-aqos.qosTrafficType"sv));
       config.videoQosType = util::from_view(args.at("x-nv-vqos[0].qosTrafficType"sv));
       config.encryptionFlagsEnabled = util::from_view(args.at("x-ss-general.encryptionEnabled"sv));
+      config.videoTcpConnections = config::stream.video_tcp_port > 0 ? std::clamp<int>(util::from_view(args.at("x-ss-video.tcpConnections"sv)), 0, 16) : 0;
 
       // Legacy clients use nvFeatureFlags to indicate support for audio encryption
       if (util::from_view(args.at("x-nv-general.featureFlags"sv)) & 0x20) {

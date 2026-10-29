@@ -536,6 +536,15 @@ namespace config {
 
     ENCRYPTION_MODE_NEVER,  // lan_encryption_mode
     ENCRYPTION_MODE_OPPORTUNISTIC,  // wan_encryption_mode
+
+    0,  // video_pacing_mbps
+    8,  // video_pacing_burst_kb
+    10,  // network_stats_interval
+
+    0,  // video_tcp_port
+    32,  // video_tcp_queue_kb
+    64,  // video_tcp_sndbuf_kb
+    -1,  // video_tcp_fec_percentage
   };
 
   nvhttp_t nvhttp {
@@ -1242,7 +1251,14 @@ namespace config {
     int_between_f(vars, "wan_encryption_mode", stream.wan_encryption_mode, {0, 2});
 
     path_f(vars, "file_apps", stream.file_apps);
-    int_between_f(vars, "fec_percentage", stream.fec_percentage, {1, 255});
+    int_between_f(vars, "fec_percentage", stream.fec_percentage, {0, 255});
+    int_between_f(vars, "video_pacing_mbps", stream.video_pacing_mbps, {0, 100000});
+    int_between_f(vars, "video_pacing_burst_kb", stream.video_pacing_burst_kb, {1, 64});
+    int_between_f(vars, "network_stats_interval", stream.network_stats_interval, {0, 3600});
+    int_between_f(vars, "video_tcp_port", stream.video_tcp_port, {0, 65535});
+    int_between_f(vars, "video_tcp_queue_kb", stream.video_tcp_queue_kb, {4, 4096});
+    int_between_f(vars, "video_tcp_sndbuf_kb", stream.video_tcp_sndbuf_kb, {0, 4096});
+    int_between_f(vars, "video_tcp_fec_percentage", stream.video_tcp_fec_percentage, {-1, 255});
 
     map_int_int_f(vars, "keybindings"s, input.keybindings);
 

@@ -161,6 +161,116 @@ namespace platf {
     return {port, std::string {data}};
   }
 
+  namespace {
+    // The kernel finds a connection by its address tuple, in either the IPv4 or the IPv6 table
+    struct tcp_row_t {
+      bool v4;
+      MIB_TCPROW row4;
+      MIB_TCP6ROW row6;
+    };
+
+    bool v4_endpoint(const sockaddr_storage &ss, DWORD &addr, DWORD &port) {
+      if (ss.ss_family == AF_INET) {
+        auto *sin = (const sockaddr_in *) &ss;
+        addr = sin->sin_addr.s_addr;
+        port = sin->sin_port;
+        return true;
+      }
+      auto *sin6 = (const sockaddr_in6 *) &ss;
+      if (ss.ss_family == AF_INET6 && IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)) {
+        std::memcpy(&addr, &sin6->sin6_addr.s6_addr[12], sizeof(addr));
+        port = sin6->sin6_port;
+        return true;
+      }
+      return false;
+    }
+
+    bool tcp_row(std::uintptr_t native_socket, tcp_row_t &out) {
+      sockaddr_storage local {}, remote {};
+      int local_len = sizeof(local), remote_len = sizeof(remote);
+      if (getsockname((SOCKET) native_socket, (sockaddr *) &local, &local_len) ||
+          getpeername((SOCKET) native_socket, (sockaddr *) &remote, &remote_len)) {
+        return false;
+      }
+
+      out = {};
+      if (v4_endpoint(local, out.row4.dwLocalAddr, out.row4.dwLocalPort) &&
+          v4_endpoint(remote, out.row4.dwRemoteAddr, out.row4.dwRemotePort)) {
+        out.v4 = true;
+        out.row4.dwState = MIB_TCP_STATE_ESTAB;
+        return true;
+      }
+      if (local.ss_family != AF_INET6 || remote.ss_family != AF_INET6) {
+        return false;
+      }
+      auto *l6 = (const sockaddr_in6 *) &local;
+      auto *r6 = (const sockaddr_in6 *) &remote;
+      out.row6.State = MIB_TCP_STATE_ESTAB;
+      out.row6.LocalAddr = l6->sin6_addr;
+      out.row6.dwLocalScopeId = l6->sin6_scope_id;
+      out.row6.dwLocalPort = l6->sin6_port;
+      out.row6.RemoteAddr = r6->sin6_addr;
+      out.row6.dwRemoteScopeId = r6->sin6_scope_id;
+      out.row6.dwRemotePort = r6->sin6_port;
+      return true;
+    }
+
+    template<class Rod>
+    bool get_tcp_estats(tcp_row_t &r, TCP_ESTATS_TYPE type, Rod &rod) {
+      auto err = r.v4 ?
+                   GetPerTcpConnectionEStats(&r.row4, type, nullptr, 0, 0, nullptr, 0, 0, (PUCHAR) &rod, 0, sizeof(rod)) :
+                   GetPerTcp6ConnectionEStats(&r.row6, type, nullptr, 0, 0, nullptr, 0, 0, (PUCHAR) &rod, 0, sizeof(rod));
+      return err == NO_ERROR;
+    }
+  }  // namespace
+
+  bool enable_tcp_stats(std::uintptr_t native_socket) {
+    tcp_row_t r;
+    if (!tcp_row(native_socket, r)) {
+      return false;
+    }
+    // The RW struct of every statistics type is a single EnableCollection flag
+    TCP_ESTATS_PATH_RW_v0 rw {TRUE};
+    for (auto type : {TcpConnectionEstatsData, TcpConnectionEstatsSndCong, TcpConnectionEstatsPath}) {
+      auto err = r.v4 ?
+                   SetPerTcpConnectionEStats(&r.row4, type, (PUCHAR) &rw, 0, sizeof(rw), 0) :
+                   SetPerTcp6ConnectionEStats(&r.row6, type, (PUCHAR) &rw, 0, sizeof(rw), 0);
+      if (err != NO_ERROR) {
+        BOOST_LOG(warning) << "SetPerTcpConnectionEStats() failed: "sv << err;
+        return false;
+      }
+    }
+    return true;
+  }
+
+  std::string tcp_stats(std::uintptr_t native_socket) {
+    tcp_row_t r;
+    TCP_ESTATS_DATA_ROD_v0 data {};
+    TCP_ESTATS_SND_CONG_ROD_v0 cong {};
+    TCP_ESTATS_PATH_ROD_v0 path {};
+    if (!tcp_row(native_socket, r) ||
+        !get_tcp_estats(r, TcpConnectionEstatsData, data) ||
+        !get_tcp_estats(r, TcpConnectionEstatsSndCong, cong) ||
+        !get_tcp_estats(r, TcpConnectionEstatsPath, path)) {
+      return {};
+    }
+
+    // cwnd/ssthresh in KB, RTT and RTO in ms, retransmitted packets, fast retransmits, RTO timeouts,
+    // then the time (ms) spent limited by cwnd / receive window / no data to send
+    std::ostringstream ss;
+    ss << "w" << cong.CurCwnd / 1024 << "k ss";
+    if (cong.CurSsthresh == 0xFFFFFFFF) {
+      ss << "-";
+    } else {
+      ss << cong.CurSsthresh / 1024 << "k";
+    }
+    ss << " rtt" << path.SmoothedRtt << " rto" << path.CurRto
+       << " rx" << path.PktsRetrans << " fr" << path.FastRetran << " to" << path.Timeouts
+       << " lim" << cong.SndLimTimeCwnd << "/" << cong.SndLimTimeRwin << "/" << cong.SndLimTimeSnd
+       << " out" << (data.SndMax - data.SndUna) / 1024 << "k";
+    return ss.str();
+  }
+
   adapteraddrs_t get_adapteraddrs() {
     adapteraddrs_t info {nullptr};
     ULONG size = 0;

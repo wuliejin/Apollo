@@ -583,6 +583,16 @@ namespace platf {
   std::string from_sockaddr(const sockaddr *const);
   std::pair<std::uint16_t, std::string> from_sockaddr_ex(const sockaddr *const);
 
+  /**
+   * @brief Turn on the kernel's extended statistics for a connected TCP socket (needs admin rights).
+   */
+  bool enable_tcp_stats(std::uintptr_t native_socket);
+
+  /**
+   * @brief Short summary of the congestion and loss counters of a TCP socket, or empty if unavailable.
+   */
+  std::string tcp_stats(std::uintptr_t native_socket);
+
   std::unique_ptr<audio_control_t> audio_control();
 
   /**

@@ -83,6 +83,11 @@ namespace upnp {
         {{gs_https, gs_https, "TCP"s}, "Sunshine - Client HTTPS"s},
       });
 
+      if (config::stream.video_tcp_port > 0) {
+        auto video_tcp = std::to_string(config::stream.video_tcp_port);
+        mappings.emplace_back(mapping_t {{video_tcp, video_tcp, "TCP"s}, "Sunshine - Video TCP"s});
+      }
+
       // Only map port for the Web Manager if it is configured to accept connection from WAN
       if (net::from_enum_string(config::nvhttp.origin_web_ui_allowed) > net::LAN) {
         mappings.emplace_back(mapping_t {{wm_http, wm_http, "TCP"s}, "Sunshine - Web UI"s});

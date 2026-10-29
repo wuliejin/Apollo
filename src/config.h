@@ -174,6 +174,26 @@ namespace config {
     // Video encryption settings for LAN and WAN streams
     int lan_encryption_mode;
     int wan_encryption_mode;
+
+    // Video send pacing. 0 keeps the legacy ~800 Mbps intra-frame pacing.
+    // Otherwise video packets are released by a token bucket at this rate (Mbps, counted
+    // with IP/UDP headers) in bursts of at most video_pacing_burst_kb.
+    int video_pacing_mbps;
+    int video_pacing_burst_kb;
+
+    // Seconds between "Network stats" log lines while streaming, 0 disables them.
+    int network_stats_interval;
+
+    // Optional video transport over several TCP connections (0 disables it). Clients that
+    // opt in connect to this port and the video packets are spread across their connections.
+    // A packet is dropped instead of queued once every connection has more than
+    // video_tcp_queue_kb waiting, which bounds the latency a stalled connection can add.
+    int video_tcp_port;
+    int video_tcp_queue_kb;
+    int video_tcp_sndbuf_kb;
+    // FEC percentage used while video goes over TCP (-1 keeps fec_percentage). TCP does not
+    // lose packets, it only delays them, so parity rarely recovers anything there.
+    int video_tcp_fec_percentage;
   };
 
   struct nvhttp_t {
