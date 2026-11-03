@@ -109,6 +109,7 @@ namespace platf {
     set_motion_event_state,  ///< Set motion event state
     set_rgb_led,  ///< Set RGB LED
     set_adaptive_triggers,  ///< Set adaptive triggers
+    haptics_pcm,  ///< 5 ms of 48 kHz S16LE stereo actuator samples
   };
 
   struct gamepad_feedback_msg_t {
@@ -157,6 +158,12 @@ namespace platf {
     std::uint16_t id;
 
     union {
+      struct {
+        std::uint32_t sequence;
+        std::uint64_t generated_us;
+        std::array<std::uint8_t, 960> samples;
+      } haptics;
+
       struct {
         std::uint16_t lowfreq;
         std::uint16_t highfreq;

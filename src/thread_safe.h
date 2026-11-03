@@ -258,6 +258,23 @@ namespace safe {
         _max_elements {max_elements} {
     }
 
+    // Bounded admission for disposable realtime data. Unlike raise(), this
+    // never clears pending control events when the mailbox is full.
+    template<class... Args>
+    bool try_raise(Args &&...args) {
+      std::lock_guard guard {_lock};
+      if (!_continue || _queue.size() >= _max_elements) return false;
+      _queue.emplace_back(std::forward<Args>(args)...);
+      _cv.notify_all();
+      return true;
+    }
+
+    template<class Predicate>
+    void discard_if(Predicate predicate) {
+      std::lock_guard guard {_lock};
+      std::erase_if(_queue, std::move(predicate));
+    }
+
     template<class... Args>
     void raise(Args &&...args) {
       std::lock_guard ul {_lock};

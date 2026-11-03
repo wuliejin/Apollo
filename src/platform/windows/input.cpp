@@ -17,6 +17,7 @@
 // local includes
 #include "keylayout.h"
 #include "misc.h"
+#include "gamepad_lvg.h"
 #include "src/config.h"
 #include "src/globals.h"
 #include "src/logging.h"
@@ -198,14 +199,15 @@ namespace platf {
 
   class vigem_t {
   public:
-    int init() {
+    int init(bool report_missing) {
       // Probe ViGEm during startup to see if we can successfully attach gamepads. This will allow us to
       // immediately display the error message in the web UI even before the user tries to stream.
       client_t client {vigem_alloc()};
       VIGEM_ERROR status = vigem_connect(client.get());
       if (!VIGEM_SUCCESS(status)) {
         // Log a special fatal message for this case to show the error in the web UI
-        BOOST_LOG(fatal) << "ViGEmBus is not installed or running. You must install ViGEmBus for gamepad support!"sv;
+        if (report_missing) BOOST_LOG(error) << "Neither libvirtualgamepad nor ViGEmBus is available for gamepad input"sv;
+        return -1;
       } else {
         vigem_disconnect(client.get());
       }
@@ -443,10 +445,12 @@ namespace platf {
 
   struct input_raw_t {
     ~input_raw_t() {
+      delete lvg;
       delete vigem;
     }
 
     vigem_t *vigem;
+    lvg_gamepad_t *lvg;
 
     decltype(CreateSyntheticPointerDevice) *fnCreateSyntheticPointerDevice;
     decltype(InjectSyntheticPointerInput) *fnInjectSyntheticPointerInput;
@@ -457,8 +461,10 @@ namespace platf {
     input_t result {new input_raw_t {}};
     auto &raw = *(input_raw_t *) result.get();
 
+    raw.lvg = new lvg_gamepad_t {};
+    raw.lvg->probe();
     raw.vigem = new vigem_t {};
-    if (raw.vigem->init()) {
+    if (raw.vigem->init(!raw.lvg->available())) {
       delete raw.vigem;
       raw.vigem = nullptr;
     }
@@ -1176,6 +1182,16 @@ namespace platf {
   int alloc_gamepad(input_t &input, const gamepad_id_t &id, const gamepad_arrival_t &metadata, feedback_queue_t feedback_queue) {
     auto raw = (input_raw_t *) input.get();
 
+    if (raw->lvg->available() && config::input.gamepad != "x360" &&
+        !(config::input.gamepad == "auto" && metadata.type == LI_CTYPE_XBOX_360)) {
+      return raw->lvg->alloc(id, metadata, std::move(feedback_queue));
+    }
+    if (config::input.gamepad == "xone" || config::input.gamepad == "xseries" ||
+        config::input.gamepad == "ds5" || config::input.gamepad == "switch") {
+      BOOST_LOG(error) << "The selected controller requires the libvirtualgamepad driver";
+      return -1;
+    }
+
     if (!raw->vigem) {
       return 0;
     }
@@ -1228,6 +1244,8 @@ namespace platf {
   }
 
   void free_gamepad(input_t &input, int nr) {
+    auto lvg = ((input_raw_t *) input.get())->lvg;
+    if (lvg->owns(nr)) { lvg->free(nr); return; }
     auto raw = (input_raw_t *) input.get();
 
     if (!raw->vigem) {
@@ -1488,6 +1506,8 @@ namespace platf {
    * @param gamepad_state The gamepad button/axis state sent from the client.
    */
   void gamepad_update(input_t &input, int nr, const gamepad_state_t &gamepad_state) {
+    auto lvg = ((input_raw_t *) input.get())->lvg;
+    if (lvg->owns(nr)) { lvg->update(nr, gamepad_state); return; }
     auto vigem = ((input_raw_t *) input.get())->vigem;
 
     // If there is no gamepad support
@@ -1520,6 +1540,8 @@ namespace platf {
    * @param touch The touch event.
    */
   void gamepad_touch(input_t &input, const gamepad_touch_t &touch) {
+    auto lvg = ((input_raw_t *) input.get())->lvg;
+    if (lvg->owns(touch.id.globalIndex)) { lvg->touch(touch); return; }
     auto vigem = ((input_raw_t *) input.get())->vigem;
 
     // If there is no gamepad support
@@ -1626,6 +1648,8 @@ namespace platf {
    * @param motion The motion event.
    */
   void gamepad_motion(input_t &input, const gamepad_motion_t &motion) {
+    auto lvg = ((input_raw_t *) input.get())->lvg;
+    if (lvg->owns(motion.id.globalIndex)) { lvg->motion(motion); return; }
     auto vigem = ((input_raw_t *) input.get())->vigem;
 
     // If there is no gamepad support
@@ -1653,6 +1677,8 @@ namespace platf {
    * @param battery The battery event.
    */
   void gamepad_battery(input_t &input, const gamepad_battery_t &battery) {
+    auto lvg = ((input_raw_t *) input.get())->lvg;
+    if (lvg->owns(battery.id.globalIndex)) { lvg->battery(battery); return; }
     auto vigem = ((input_raw_t *) input.get())->vigem;
 
     // If there is no gamepad support
@@ -1732,20 +1758,30 @@ namespace platf {
         supported_gamepad_t {"auto", true, ""},
         supported_gamepad_t {"x360", false, ""},
         supported_gamepad_t {"ds4", false, ""},
+        supported_gamepad_t {"xone", true, ""},
+        supported_gamepad_t {"xseries", true, ""},
+        supported_gamepad_t {"ds5", true, ""},
+        supported_gamepad_t {"switch", true, ""},
       };
 
       return gps;
     }
 
     auto vigem = ((input_raw_t *) input)->vigem;
-    auto enabled = vigem != nullptr;
+    const auto lvg = ((input_raw_t *) input)->lvg;
+    const bool modern = lvg->available();
+    auto enabled = vigem != nullptr || modern;
     auto reason = enabled ? "" : "gamepads.vigem-not-available";
 
     // ds4 == ps4
     static std::vector gps {
       supported_gamepad_t {"auto", true, reason},
-      supported_gamepad_t {"x360", enabled, reason},
-      supported_gamepad_t {"ds4", enabled, reason}
+      supported_gamepad_t {"x360", vigem != nullptr, reason},
+      supported_gamepad_t {"ds4", enabled, reason},
+      supported_gamepad_t {"xone", modern, reason},
+      supported_gamepad_t {"xseries", modern, reason},
+      supported_gamepad_t {"ds5", modern, reason},
+      supported_gamepad_t {"switch", modern, reason}
     };
 
     for (auto &[name, is_enabled, reason_disabled] : gps) {

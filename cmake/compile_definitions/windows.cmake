@@ -32,6 +32,7 @@ file(GLOB NVPREFS_FILES CONFIGURE_DEPENDS
 
 # vigem
 include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/third-party/ViGEmClient/include")
+include_directories(SYSTEM "${CMAKE_SOURCE_DIR}/third-party/libvirtualgamepad/include")
 
 # apollo icon
 if(NOT DEFINED PROJECT_ICON_PATH)
@@ -53,6 +54,12 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/misc.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/misc.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/input.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/gamepad_lvg.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/dualsense_usbip_protocol.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/dualsense_usbip_transport.cpp"
+        "${CMAKE_SOURCE_DIR}/third-party/libvirtualgamepad/client/client.cpp"
+        "${CMAKE_SOURCE_DIR}/third-party/libvirtualgamepad/driver/src/dualsense.cpp"
+        "${CMAKE_SOURCE_DIR}/third-party/libvirtualgamepad/driver/src/dualshock4.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_base.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_vram.cpp"
@@ -79,6 +86,7 @@ set(OPENSSL_LIBRARIES
 list(PREPEND PLATFORM_LIBRARIES
         ${CURL_STATIC_LIBRARIES}
         avrt
+        cfgmgr32
         d3d11
         D3DCompiler
         dwmapi

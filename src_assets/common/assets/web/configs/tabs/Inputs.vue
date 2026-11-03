@@ -35,6 +35,10 @@ const config = ref(props.config)
           </template>
 
           <template #windows>
+            <option value="xone">{{ $t('config.gamepad_xone') }}</option>
+            <option value="xseries">Xbox Series</option>
+            <option value="ds5">DualSense (PS5)</option>
+            <option value="switch">{{ $t('config.gamepad_switch') }}</option>
             <option value="ds4">{{ $t('config.gamepad_ds4') }}</option>
             <option value="x360">{{ $t('config.gamepad_x360') }}</option>
           </template>
