@@ -325,6 +325,12 @@ namespace video {
     avcodec_encode_session_t(avcodec_encode_session_t &&other) noexcept = default;
 
     ~avcodec_encode_session_t() {
+      // Flush any remaining frames in the encoder
+      if (avcodec_send_frame(avcodec_ctx.get(), nullptr) == 0) {
+        packet_raw_avcodec pkt;
+        while (avcodec_receive_packet(avcodec_ctx.get(), pkt.av_packet) == 0);
+      }
+
       // Order matters here because the context relies on the hwdevice still being valid
       avcodec_ctx.reset();
       device.reset();
@@ -546,7 +552,7 @@ namespace video {
         {"forced-idr"s, 1},
         {"zerolatency"s, 1},
         {"surfaces"s, 1},
-        {"filler_data"s, false},
+        {"cbr_padding"s, false},
         {"preset"s, &config::video.nv_legacy.preset},
         {"tune"s, NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY},
         {"rc"s, NV_ENC_PARAMS_RC_CBR},
@@ -567,6 +573,7 @@ namespace video {
         {"forced-idr"s, 1},
         {"zerolatency"s, 1},
         {"surfaces"s, 1},
+        {"cbr_padding"s, false},
         {"preset"s, &config::video.nv_legacy.preset},
         {"tune"s, NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY},
         {"rc"s, NV_ENC_PARAMS_RC_CBR},
@@ -592,6 +599,7 @@ namespace video {
         {"forced-idr"s, 1},
         {"zerolatency"s, 1},
         {"surfaces"s, 1},
+        {"cbr_padding"s, false},
         {"preset"s, &config::video.nv_legacy.preset},
         {"tune"s, NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY},
         {"rc"s, NV_ENC_PARAMS_RC_CBR},
@@ -740,6 +748,7 @@ namespace video {
         {"filler_data"s, false},
         {"forced_idr"s, 1},
         {"latency"s, "lowest_latency"s},
+        {"async_depth"s, 1},
         {"skip_frame"s, 0},
         {"log_to_dbg"s, []() {
            return config::sunshine.min_log_level < 2 ? 1 : 0;
@@ -763,6 +772,7 @@ namespace video {
         {"filler_data"s, false},
         {"forced_idr"s, 1},
         {"latency"s, 1},
+        {"async_depth"s, 1},
         {"skip_frame"s, 0},
         {"log_to_dbg"s, []() {
            return config::sunshine.min_log_level < 2 ? 1 : 0;
@@ -801,6 +811,7 @@ namespace video {
         {"filler_data"s, false},
         {"forced_idr"s, 1},
         {"latency"s, 1},
+        {"async_depth"s, 1},
         {"frame_skipping"s, 0},
         {"log_to_dbg"s, []() {
            return config::sunshine.min_log_level < 2 ? 1 : 0;
@@ -810,9 +821,17 @@ namespace video {
         {"rc"s, &config::video.amd.amd_rc_h264},
         {"usage"s, &config::video.amd.amd_usage_h264},
         {"vbaq"s, &config::video.amd.amd_vbaq},
+        {"coder"s, &config::video.amd.amd_coder},
         {"enforce_hrd"s, &config::video.amd.amd_enforce_hrd},
       },
-      {},  // SDR-specific options
+      {
+        // SDR-specific options
+        {"profile"s, [](const config_t &cfg) {
+           if (cfg.profile == 66) return "baseline"s;
+           if (cfg.profile == 77) return "main"s;
+           return "high"s;
+         }},
+      },
       {},  // HDR-specific options
       {},  // YUV444 SDR-specific options
       {},  // YUV444 HDR-specific options
@@ -950,8 +969,7 @@ namespace video {
       {},  // Fallback options
       "h264_vaapi"s,
     },
-    // RC buffer size will be set in platform code if supported
-    LIMITED_GOP_SIZE | PARALLEL_ENCODING | NO_RC_BUF_LIMIT
+    PARALLEL_ENCODING
   };
 #endif
 
@@ -1559,22 +1577,22 @@ namespace video {
         case 0:
           // 10-bit h264 encoding is not supported by our streaming protocol
           assert(!config.dynamicRange);
-          ctx->profile = (config.chromaSamplingType == 1) ? FF_PROFILE_H264_HIGH_444_PREDICTIVE : FF_PROFILE_H264_HIGH;
+          ctx->profile = (config.chromaSamplingType == 1) ? AV_PROFILE_H264_HIGH_444_PREDICTIVE : AV_PROFILE_H264_HIGH;
           break;
 
         case 1:
           if (config.chromaSamplingType == 1) {
             // HEVC uses the same RExt profile for both 8 and 10 bit YUV 4:4:4 encoding
-            ctx->profile = FF_PROFILE_HEVC_REXT;
+            ctx->profile = AV_PROFILE_HEVC_REXT;
           } else {
-            ctx->profile = config.dynamicRange ? FF_PROFILE_HEVC_MAIN_10 : FF_PROFILE_HEVC_MAIN;
+            ctx->profile = config.dynamicRange ? AV_PROFILE_HEVC_MAIN_10 : AV_PROFILE_HEVC_MAIN;
           }
           break;
 
         case 2:
           // AV1 supports both 8 and 10 bit encoding with the same Main profile
           // but YUV 4:4:4 sampling requires High profile
-          ctx->profile = (config.chromaSamplingType == 1) ? FF_PROFILE_AV1_HIGH : FF_PROFILE_AV1_MAIN;
+          ctx->profile = (config.chromaSamplingType == 1) ? AV_PROFILE_AV1_HIGH : AV_PROFILE_AV1_MAIN;
           break;
       }
 
@@ -1966,6 +1984,7 @@ namespace video {
     }
 
     std::chrono::steady_clock::time_point encode_frame_timestamp;
+    bool missing_frame_timestamp_warning_logged = false;
 
     while (true) {
       // Break out of the encoding loop if any of the following are true:
@@ -2002,7 +2021,16 @@ namespace video {
       if (!requested_idr_frame || images->peek()) {
         if (auto img = images->pop(max_frametime)) {
           frame_timestamp = img->frame_timestamp;
-          auto time_diff = *frame_timestamp - encode_frame_timestamp;
+          if (!frame_timestamp) {
+            if (!missing_frame_timestamp_warning_logged) {
+              BOOST_LOG(warning) << "Encoder received image without frame timestamp; substituting steady_clock::now()"sv;
+              missing_frame_timestamp_warning_logged = true;
+            }
+            frame_timestamp = std::chrono::steady_clock::now();
+          }
+
+          auto current_timestamp = *frame_timestamp;
+          auto time_diff = current_timestamp - encode_frame_timestamp;
 
           // If new frame comes in way too fast, just drop
           if (time_diff < -frame_variation_threshold) {
@@ -2017,7 +2045,7 @@ namespace video {
           if (time_diff < frame_variation_threshold) {
             *frame_timestamp = encode_frame_timestamp;
           } else {
-            encode_frame_timestamp = *frame_timestamp;
+            encode_frame_timestamp = current_timestamp;
           }
 
           encode_frame_timestamp += encode_frame_threshold;

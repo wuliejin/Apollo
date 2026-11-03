@@ -4,6 +4,7 @@
  */
 // standard includes
 #include <fcntl.h>
+#include <format>
 #include <sstream>
 #include <string>
 
@@ -190,7 +191,7 @@ namespace va {
         return VAProfileH264High;
       } else if (ctx->codec_id == AV_CODEC_ID_HEVC) {
         switch (ctx->profile) {
-          case FF_PROFILE_HEVC_REXT:
+          case AV_PROFILE_HEVC_REXT:
             switch (av_pix_fmt_desc_get(ctx->sw_pix_fmt)->comp[0].depth) {
               case 10:
                 return VAProfileHEVCMain444_10;
@@ -198,16 +199,16 @@ namespace va {
                 return VAProfileHEVCMain444;
             }
             break;
-          case FF_PROFILE_HEVC_MAIN_10:
+          case AV_PROFILE_HEVC_MAIN_10:
             return VAProfileHEVCMain10;
-          case FF_PROFILE_HEVC_MAIN:
+          case AV_PROFILE_HEVC_MAIN:
             return VAProfileHEVCMain;
         }
       } else if (ctx->codec_id == AV_CODEC_ID_AV1) {
         switch (ctx->profile) {
-          case FF_PROFILE_AV1_HIGH:
+          case AV_PROFILE_AV1_HIGH:
             return VAProfileAV1Profile1;
-          case FF_PROFILE_AV1_MAIN:
+          case AV_PROFILE_AV1_MAIN:
             return VAProfileAV1Profile0;
         }
       }
@@ -286,7 +287,16 @@ namespace va {
         BOOST_LOG(warning) << "Using CQP rate control"sv;
         av_dict_set_int(options, "qp", config::video.qp, 0);
       } else {
-        BOOST_LOG(info) << "Using default rate control"sv;
+        // For remaining VAAPI encoders (typically AMD H.264/HEVC), explicitly
+        // select a rate control mode. The VBV buffer size is already set by
+        // the common encoder code in video.cpp.
+        if (rc_attr.value & VA_RC_CBR) {
+          BOOST_LOG(info) << "Using CBR rate control"sv;
+          av_dict_set(options, "rc_mode", "CBR", 0);
+        } else if (rc_attr.value & VA_RC_VBR) {
+          BOOST_LOG(info) << "Using VBR rate control"sv;
+          av_dict_set(options, "rc_mode", "VBR", 0);
+        }
       }
     }
 
@@ -574,7 +584,7 @@ namespace va {
     if (!display) {
       char string[1024];
 
-      auto bytes = readlink(("/proc/self/fd/" + std::to_string(fd)).c_str(), string, sizeof(string));
+      auto bytes = readlink(std::format("/proc/self/fd/{}", fd).c_str(), string, sizeof(string));
 
       std::string_view render_device {string, (std::size_t) bytes};
 

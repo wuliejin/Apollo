@@ -1,5 +1,16 @@
 # Apollo
 
+## 此 fork 的自定义功能
+
+`master` 包含 TCP 视频传输、视频发包节奏控制，以及 Windows 下基于
+libvirtualgamepad 的 Xbox One / Series、DualSense 等手柄后端和高清波形触觉。
+需要搭配 [本 fork 的 Moonlight](https://github.com/wuliejin/moonlight-qt)。
+驱动要求、验证范围和源码获取方式见 [手柄集成说明](docs/native_gamepads.md)。
+
+```sh
+git clone --recurse-submodules https://github.com/wuliejin/Apollo.git
+```
+
 Apollo is a self-hosted desktop stream host for [Artemis(Moonlight Noir)](https://github.com/ClassicOldSong/moonlight-android). Offering low latency, native client resolution, cloud gaming server capabilities with support for AMD, Intel, and Nvidia GPUs for hardware encoding. Software encoding is also available. A web UI is provided to allow configuration and client pairing from your favorite web browser. Pair from the local server or any mobile device.
 
 Major features:
@@ -58,9 +69,9 @@ Whether HDR streaming looks good, it depends completely on your client.
 
 In short, ICC color correction should be totally useless while streaming HDR. It's your client's job to get HDR content displayed right, not the host. But in fact, it does affect the captured video stream and reflect changes on devices that can handle HDR correctly. On other devices that can't, the info is not respected at all.
 
-It's very complicated to explain why HDR is a total mess, and why enabling HDR makes the image appear dark/yellow. If it's your first time got HDR streaming working, and thinks HDR looks awuful, you're right, but that's not Apollo's fault, it's your device that tone mapped SDR content to the maximum of the capability of its screen, there's no headroom for anything beyond that actual peak brightness for HDR. For details, please take a look [here](https://github.com/ClassicOldSong/Apollo/issues/164).
+It's very complicated to explain why HDR is a total mess, and why enabling HDR makes the image appear dark/yellow. If it's your first time got HDR streaming working, and thinks HDR looks awful, you're right, but that's not Apollo's fault, it's your device that tone mapped SDR content to the maximum of the capability of its screen, there's no headroom for anything beyond that actual peak brightness for HDR. For details, please take a look [here](https://github.com/ClassicOldSong/Apollo/issues/164).
 
-Usually Apple devices that have HDR capability can be trusted to have good results, other than that, your luck depends.
+For client devices, usually Apple products that have HDR capability can be trusted to have good results, other than that, your luck depends.
 
 <details>
 <summary>DEPRECATION ALERT</summary>
@@ -83,7 +94,7 @@ Here're some common causes and solutions for stutters: [WiKi](https://github.com
 
 ## Device specific setups
 - Pixel devices might not be able to use native resolution:
-  - Change the device resolution to High: https://github.com/ClassicOldSong/Apollo/issues/700
+  - Change the device resolution to Max: https://github.com/ClassicOldSong/Apollo/issues/700
 
 ## System Requirements
 
@@ -155,7 +166,40 @@ No real time chat support will ever be provided for Apollo and Artemis. Includin
 
 ## Downloads
 
+### Direct Download
+
+**Recommended**
+
 [Releases](https://github.com/ClassicOldSong/Apollo/releases)
+
+### WinGet
+
+**Note:** Community maintained
+
+In an elevated PowerShell window, run
+
+```pwsh
+winget install ClassicOldSong.Apollo
+
+```
+
+You'll need WinGet installed first.
+
+### Chocolatey
+
+**Note:** Community maintained
+
+You can also install the apollo streaming server with chocolatey.
+
+Install Chocolatey if you don't have it, then run the following command in an elevated PowerShell/CMD window:
+
+```pwsh
+choco upgrade apollo -y
+```
+
+Same command can be used to upgrade, add to a scheduled task to automate updates.
+
+See more details on the chocolatey package [here](https://community.chocolatey.org/packages/apollo)
 
 ## Disclaimer
 

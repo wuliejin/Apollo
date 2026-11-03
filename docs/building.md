@@ -3,6 +3,15 @@ Sunshine binaries are built using [CMake](https://cmake.org) and requires `cmake
 
 ## Building Locally
 
+### Compiler
+It is recommended to use one of the following compilers:
+
+| Compiler    | Version |
+|:------------|:--------|
+| GCC         | 13+     |
+| Clang       | 17+     |
+| Apple Clang | 15+     |
+
 ### Dependencies
 
 #### Linux
@@ -16,11 +25,12 @@ Sunshine requires CUDA Toolkit for NVFBC capture. There are two caveats to CUDA:
 
 1. The version installed depends on the version of GCC.
 2. The version of CUDA you use will determine compatibility with various GPU generations.
-   At the time of writing, the recommended version to use is CUDA ~11.8.
+   At the time of writing, the recommended version to use is CUDA ~12.9.
    See [CUDA compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/index.html) for more info.
 
-@tip{To install older versions, select the appropriate run file based on your desired CUDA version and architecture
-according to [CUDA Toolkit Archive](https://developer.nvidia.com/cuda-toolkit-archive)}
+> [!NOTE]
+> To install older versions, select the appropriate run file based on your desired CUDA version and architecture
+> according to [CUDA Toolkit Archive](https://developer.nvidia.com/cuda-toolkit-archive)
 
 #### macOS
 You can either use [Homebrew](https://brew.sh) or [MacPorts](https://www.macports.org) to install dependencies.
@@ -92,7 +102,6 @@ dependencies=(
   "mingw-w64-ucrt-x86_64-graphviz"  # Optional, for docs
   "mingw-w64-ucrt-x86_64-MinHook"
   "mingw-w64-ucrt-x86_64-miniupnpc"
-  "mingw-w64-ucrt-x86_64-nodejs"
   "mingw-w64-ucrt-x86_64-nsis"
   "mingw-w64-ucrt-x86_64-onevpl"
   "mingw-w64-ucrt-x86_64-openssl"
@@ -102,6 +111,18 @@ dependencies=(
 )
 pacman -S "${dependencies[@]}"
 ```
+
+##### Install Node.js
+Install Node.js separately from [nodejs.org](https://nodejs.org/) (LTS or current) or via
+[nvm-windows](https://github.com/coreybutler/nvm-windows). Don't install MSYS2's
+`mingw-w64-ucrt-x86_64-nodejs` — it's compiled with the MSYS2 gcc-16 libstdc++ which has
+a `std::bad_weak_ptr` regression that crashes Node during process init (see
+[apache/arrow#49958](https://github.com/apache/arrow/issues/49958) for the upstream
+toolchain trail). The official MSVC-built Node.js isn't affected.
+
+Make sure `node.exe` is on `PATH` before running `cmake` — the `web-ui` CMake target
+invokes `npm install` via `find_program(NPM npm)`, so the official Node's `npm` must be
+visible to CMake.
 
 ### Clone
 Ensure [git](https://git-scm.com) is installed on your system, then clone the repository using the following command:
@@ -119,8 +140,9 @@ cmake -B build -G Ninja -S .
 ninja -C build
 ```
 
-@tip{Available build options can be found in
-[options.cmake](https://github.com/LizardByte/Sunshine/blob/master/cmake/prep/options.cmake).}
+> [!TIP]
+> Available build options can be found in
+> [options.cmake](https://github.com/LizardByte/Sunshine/blob/master/cmake/prep/options.cmake).
 
 ### Package
 
