@@ -826,11 +826,8 @@ namespace video {
       },
       {
         // SDR-specific options
-        {"profile"s, [](const config_t &cfg) {
-           if (cfg.profile == 66) return "baseline"s;
-           if (cfg.profile == 77) return "main"s;
-           return "high"s;
-         }},
+        // Session negotiation selects High for H.264 4:2:0.
+        {"profile"s, "high"s},
       },
       {},  // HDR-specific options
       {},  // YUV444 SDR-specific options
