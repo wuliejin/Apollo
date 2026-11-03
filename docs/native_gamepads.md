@@ -48,8 +48,9 @@ DualSense 的 USB 描述符、Sony feature、分片 URB、unlink、音频节奏�
 这是一套手柄协议模拟与反馈回传方案，不是 USB 整机透传。部分应用仍会显示通用 XInput 名称或图标。
 
 启用详细客户端震动日志可设置 `MOONLIGHT_GAMEPAD_TRACE=1`。
-配置 Sunshine 测试构建后，可以通过 `ctest -R test_dualsense_usbip_protocol --output-on-failure`
-运行独立 USB/IP 协议测试。
+配置 Sunshine 测试构建后，可以通过
+`ctest --test-dir build/tests -R test_dualsense_usbip_protocol --output-on-failure`
+运行独立 USB/IP 协议测试；将 `build` 替换为实际构建目录。
 
 ## 来源与许可
 
